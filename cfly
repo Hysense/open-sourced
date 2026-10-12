@@ -1,0 +1,67 @@
+local plrs = game:GetService("Players")
+local inp = game:GetService("UserInputService")
+local run = game:GetService("RunService")
+
+local plr = plrs.LocalPlayer
+local cam = workspace.CurrentCamera
+
+local spd = 400
+local fly = false
+local keys = {}
+
+local chr
+local hum
+local root
+
+local function char(m)
+	chr = m
+	hum = chr:WaitForChild("Humanoid")
+	root = chr:WaitForChild("HumanoidRootPart")
+end
+
+if plr.Character then
+	char(plr.Character)
+end
+plr.CharacterAdded:Connect(char)
+
+inp.InputBegan:Connect(function(i, gp)
+	if gp then return end
+	local k = i.KeyCode
+
+	if k == Enum.KeyCode.T then
+		fly = not fly
+		if fly and hum then
+			hum:ChangeState(Enum.HumanoidStateType.Freefall)
+		end
+	end
+
+	keys[k] = true
+end)
+
+inp.InputEnded:Connect(function(i)
+	keys[i.KeyCode] = nil
+end)
+
+run.RenderStepped:Connect(function()
+	if not fly or not root then return end
+
+	if hum then
+		hum:ChangeState(Enum.HumanoidStateType.Freefall)
+	end
+
+	local d = Vector3.zero
+	local cf = cam.CFrame
+
+	if keys[Enum.KeyCode.W] then d = d + cf.LookVector end
+	if keys[Enum.KeyCode.S] then d = d - cf.LookVector end
+	if keys[Enum.KeyCode.A] then d = d - cf.RightVector end
+	if keys[Enum.KeyCode.D] then d = d + cf.RightVector end
+	if keys[Enum.KeyCode.Space] then d = d + Vector3.yAxis end
+	if keys[Enum.KeyCode.LeftControl] then d = d - Vector3.yAxis end
+
+	if d.Magnitude > 0 then
+		d = d.Unit
+	end
+
+	root.AssemblyLinearVelocity = d * spd
+end)
