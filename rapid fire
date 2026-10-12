@@ -1,0 +1,18 @@
+local plrs = game:FindFirstChildOfClass("Players")
+local plr = plrs and plrs.LocalPlayer
+
+if plr and plr.Character and plr.Character:FindFirstChild("Humanoid") then
+    plr.Character.Humanoid.Health = 0
+end
+
+local function clr(v)
+    if v:IsA("ValueBase") and (v.Name == "ShootingCooldown" or v.Name == "ToleranceCooldown") then
+        v.Value = 0.01
+    end
+end
+
+for _, v in ipairs(game:GetDescendants()) do
+    clr(v)
+end
+
+game.DescendantAdded:Connect(clr)
