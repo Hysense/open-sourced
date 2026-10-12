@@ -1,0 +1,282 @@
+local v4r1 = game:GetService("Players")
+local v4r2 = game:GetService("RunService")
+local v4r3 = game:GetService("UserInputService")
+local v4r4 = workspace.CurrentCamera
+local v4r5 = game:GetService("CoreGui")
+local v4r6 = v4r1.LocalPlayer
+local v4r7 = v4r6:GetMouse()
+local v4r8 = false
+local v4r9 = 150
+local v4r10 = Color3.fromRGB(255, 255, 255)
+getgenv().BulletConfig = {
+    Enabled = false,
+    Target = nil,
+    Part = "Head",
+    Key = Enum.KeyCode.C,
+    Prediction = 0
+}
+local v4r11 = false
+local v4r12 = Enum.KeyCode.Z
+local v4r13 = false
+local v4r14 = nil
+local v4r15 = false
+local v4r16 = nil
+local v4r17 = nil
+local v4r18 = nil
+local v4r19 = Drawing.new("Line")
+v4r19.Visible = false
+v4r19.Color = Color3.fromRGB(0, 0, 0)
+v4r19.Transparency = 0.6
+v4r19.Thickness = 1
+local v4r20 = Drawing.new("Text")
+v4r20.Visible = false
+v4r20.Center = true
+v4r20.Outline = false
+v4r20.Font = Drawing.Fonts.UI
+v4r20.Color = Color3.fromRGB(0, 0, 0)
+v4r20.Size = 22
+local v4r21 = Drawing.new("Circle")
+v4r21.Visible = v4r8
+v4r21.Radius = v4r9
+v4r21.Color = v4r10
+v4r21.Thickness = 1
+v4r21.Filled = false
+v4r21.NumSides = 64
+local function func1(t)
+    if not t or not t.Character then return nil end
+    local char = t.Character
+    local part = char and char:FindFirstChild(getgenv().BulletConfig.Part)
+    if not part then return nil end
+    return part.Position + (part.Velocity * getgenv().BulletConfig.Prediction)
+end
+local function func2(t)
+    if v4r18 then
+        v4r18:Destroy()
+        v4r18 = nil
+    end
+    if t and t.Character then
+        v4r18 = Instance.new("Highlight")
+        v4r18.FillColor = Color3.fromRGB(0, 0, 0)
+        v4r18.OutlineColor = Color3.fromRGB(200, 200, 200)
+        v4r18.FillTransparency = 0.5
+        v4r18.Adornee = t.Character
+        v4r18.Parent = v4r5
+    end
+end
+local function func3()
+    if v4r6.Character and v4r6.Character:FindFirstChild("Humanoid") and v4r4.CameraSubject ~= v4r6.Character.Humanoid then
+        v4r4.CameraSubject = v4r6.Character.Humanoid
+    end
+end
+local function func4(t)
+    if v4r11 and t and t.Character and t.Character:FindFirstChild("Humanoid") then
+        v4r4.CameraSubject = t.Character.Humanoid
+    end
+end
+local function func5(t)
+    if v4r16 then v4r16:Disconnect() v4r16 = nil end
+    if v4r17 then v4r17:Disconnect() v4r17 = nil end
+    v4r13 = (t ~= nil)
+    getgenv().BulletConfig.Target = t
+    getgenv().BulletConfig.Enabled = (t ~= nil)
+    func2(t)
+    if t then
+        v4r14 = t.UserId
+        if v4r11 then func4(t) end
+    else
+        v4r14 = nil
+        func3()
+    end
+end
+local function func6()
+    local dist = math.huge
+    local target = nil
+    local msp = v4r3:GetMouseLocation()
+    for _, v in ipairs(v4r1:GetPlayers()) do
+        if v ~= v4r6 and v.Character and v.Character:FindFirstChild("HumanoidRootPart") and v.Character.Humanoid.Health > 0 then
+            local pos, on = v4r4:WorldToViewportPoint(v.Character.HumanoidRootPart.Position)
+            if on then
+                local mag = (Vector2.new(pos.X, pos.Y) - msp).Magnitude
+                if mag < dist and mag < v4r9 then
+                    dist = mag
+                    target = v
+                end
+            end
+        end
+    end
+    return target
+end
+local function func7(t)
+    if t and t.Character then
+        local be = t.Character:FindFirstChild("BodyEffects")
+        if be then
+            if be:FindFirstChild("Dead") and be.Dead.Value == true then
+                return "[stomped]"
+            elseif be:FindFirstChild("K.O") and be["K.O"].Value == true then
+                return "[knocked]"
+            end
+        end
+        return "[alive]"
+    end
+    return "[stomped]"
+end
+local mt = getrawmetatable(game)
+local old = mt.__index
+local rsc, ic
+local function func8()
+    v4r15 = true
+    if rsc then rsc:Disconnect() end
+    if ic then ic:Disconnect() end
+    if v4r18 then v4r18:Destroy() end
+    if v4r19 then v4r19:Destroy() end
+    if v4r20 then v4r20:Destroy() end
+    if v4r21 then v4r21:Destroy() end
+    func3()
+    setreadonly(mt, false)
+    mt.__index = old
+    setreadonly(mt, true)
+end
+ic = v4r3.InputBegan:Connect(function(i, g)
+    if g then return end
+    if i.KeyCode == Enum.KeyCode.F7 then
+        func8()
+        return
+    end
+    if v4r15 then return end
+    if i.KeyCode == getgenv().BulletConfig.Key then
+        if v4r13 then
+            func5(nil)
+        else
+            if getgenv().BulletConfig.Target then
+                func5(getgenv().BulletConfig.Target)
+            end
+        end
+    elseif i.KeyCode == v4r12 then
+        v4r11 = not v4r11
+        if v4r13 and getgenv().BulletConfig.Target then
+            if v4r11 then
+                func4(getgenv().BulletConfig.Target)
+            else
+                func3()
+            end
+        elseif not v4r11 then
+            func3()
+        end
+    end
+end)
+rsc = v4r2.RenderStepped:Connect(function()
+    if v4r15 then return end
+    local msp = v4r3:GetMouseLocation()
+    local tft
+    v4r21.Position = msp
+    v4r21.Visible = v4r8 and not v4r13
+    v4r21.Radius = v4r9
+    if v4r13 and v4r14 then
+        tft = v4r1:GetPlayerByUserId(v4r14)
+    else
+        tft = func6()
+    end
+    if getgenv().BulletConfig.Target ~= tft then
+        getgenv().BulletConfig.Target = tft
+        func2(tft)
+    end
+    getgenv().BulletConfig.Enabled = (tft ~= nil)
+    local vt = getgenv().BulletConfig.Target
+    if vt then
+        v4r20.Position = Vector2.new(msp.X + 35, msp.Y + 27)
+        v4r20.Text = func7(vt)
+        v4r20.Visible = true
+        if vt.Character and vt.Character:FindFirstChild(getgenv().BulletConfig.Part) then
+            local thp = vt.Character[getgenv().BulletConfig.Part].Position
+            local sp, os = v4r4:WorldToViewportPoint(thp)
+            local ttp
+            if os then
+                ttp = Vector2.new(sp.X, sp.Y)
+            else
+                local vp = v4r4.ViewportSize
+                local ce = vp / 2
+                local p = Vector2.new(sp.X, sp.Y)
+                if sp.Z < 0 then p = ce - (p - ce) end
+                local vec = p - ce
+                if vec.Magnitude > 0 then
+                    local r = math.max(math.abs(vec.X / (vp.X / 2)), math.abs(vec.Y / (vp.Y / 2)))
+                    ttp = ce + (vec / r)
+                else
+                    ttp = ce
+                end
+            end
+            v4r19.From = Vector2.new(msp.X, msp.Y)
+            v4r19.To = ttp
+            v4r19.Visible = true
+        else
+            v4r19.Visible = false
+        end
+    else
+        v4r19.Visible = false
+        v4r20.Visible = false
+    end
+end)
+local function func9(tool)
+    if not getgenv().BulletConfig.Enabled or not getgenv().BulletConfig.Target then return end
+    local char = v4r6.Character
+    local hand = char and (char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm"))
+    local grip = hand and hand:FindFirstChild("RightGrip")
+    local ct = getgenv().BulletConfig.Target
+    local tp = func1(ct)
+    if grip and tp and hand and ct.Character then
+        local oc0 = grip.C0
+        local tpart = ct.Character[getgenv().BulletConfig.Part]
+        local bh = tp - (tpart.CFrame.LookVector * 1.5)
+        local tcf = CFrame.lookAt(bh, tp) * CFrame.Angles(math.rad(-90), 0, 0)
+        grip.C0 = hand.CFrame:ToObjectSpace(tcf)
+        v4r2.RenderStepped:Wait()
+        grip.C0 = oc0
+    end
+end
+local function func10(tool)
+    if not tool:IsA("Tool") then return end
+    for _, v in ipairs(getconnections(tool:GetPropertyChangedSignal("Grip"))) do
+        v:Disable()
+    end
+    tool.Activated:Connect(function()
+        func9(tool)
+    end)
+end
+local function func11(char)
+    char:WaitForChild("Humanoid")
+    if v4r11 and v4r13 and getgenv().BulletConfig.Target then
+        func4(getgenv().BulletConfig.Target)
+    else
+        func3()
+    end
+    char.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then func10(child) end
+    end)
+    local ctool = char:FindFirstChildOfClass("Tool")
+    if ctool then func10(ctool) end
+end
+if v4r6.Character then func11(v4r6.Character) end
+v4r6.CharacterAdded:Connect(function(char)
+    func11(char)
+    if v4r13 and getgenv().BulletConfig.Target then
+        func2(getgenv().BulletConfig.Target)
+    end
+end)
+local mt = getrawmetatable(game)
+local old = mt.__index
+setreadonly(mt, false)
+mt.__index = newcclosure(function(self, k)
+    if not checkcaller() and self == v4r7 and getgenv().BulletConfig.Enabled and getgenv().BulletConfig.Target then
+        local pos = func1(getgenv().BulletConfig.Target)
+        if pos then
+            if k == "Hit" then return CFrame.new(pos)
+            elseif k == "Target" then
+                if getgenv().BulletConfig.Target.Character then
+                    return getgenv().BulletConfig.Target.Character:FindFirstChild(getgenv().BulletConfig.Part)
+                end
+            end
+        end
+    end
+    return old(self, k)
+end)
+setreadonly(mt, true)
