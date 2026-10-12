@@ -1,0 +1,596 @@
+-- autoarmor.lua | AutoArmor System
+-- If workspace BodyEffects Armor IntValue ~= 200: teleport under "Full Armor" model,
+-- FREEZE, fire clickdetector until Armor == 200, UNFREEZE, teleport back.
+-- No tool involved: buying applies the effect directly.
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+--// Config
+local ARMOR_TARGET = 200
+local CHECK_INTERVAL = 0.5 -- backup poll (value hook below is the instant trigger)
+local BUY_TIMEOUT = 10
+local UNDER_OFFSET = 7 -- max search depth below the detector
+local BUY_DEBOUNCE = 0.5 -- seconds between buys
+local TICK = 0.1 -- buy retry rate
+local RANGE_MARGIN = 3 -- stay this many studs inside MaxActivationDistance
+local VOID_MARGIN = 25 -- treat anything this far above kill-plane as void-adjacent
+local GROUND_SCAN_DEPTH = 2000 -- how far down to look for ground when validating return
+local SECURE_RADIUS = 10 -- if knocked/flung further than this from buy spot, snap back
+local TP_TRIES = 6 -- teleport replication attempts (first set lands instantly, rest confirm)
+local TP_TICK = 0.1 -- wait between teleport attempts (must exceed network round-trip or confirms lie)
+local TP_RADIUS = 5 -- must confirm within this many studs or it's not a real teleport
+local FAIL_LOCKOUT_FAILS = 3 -- consecutive failed buys before cooling down
+local FAIL_LOCKOUT_S = 15 -- cooldown seconds (stops teleport-spam loops)
+local MODEL_SKIP_FAILS = 2 -- failures on one model before trying a different one
+local MODEL_SKIP_S = 60 -- how long a failed model stays deprioritized
+local DEBUG_ARMOR = false -- print spot/arrival diagnostics
+
+local buying = false
+local failStreak = 0 -- consecutive failed buys (circuit breaker)
+local lockoutUntil = 0 -- os.clock() timestamp: no buys before this
+local modelFails = {} -- model -> {n, t}: per-spot failure memory
+
+-- Circuit breaker: repeated failures cool down instead of teleport-spamming.
+-- Emergency stop without rejoining: run `_G.autoarmorOff = true`.
+local function noteFail(model)
+    failStreak = failStreak + 1
+    if model then
+        local rec = modelFails[model] or { n = 0, t = 0 }
+        rec.n = rec.n + 1
+        rec.t = os.clock()
+        modelFails[model] = rec
+    end
+    if failStreak >= FAIL_LOCKOUT_FAILS then
+        lockoutUntil = os.clock() + FAIL_LOCKOUT_S
+        failStreak = 0
+        warn("[autoarmor] failing repeatedly - cooling down "
+            .. FAIL_LOCKOUT_S .. "s (run _G.autoarmorOff=true to stop)")
+    end
+end
+
+local function noteSuccess()
+    failStreak = 0
+end
+
+--// Helpers
+
+local function normalizeName(s)
+    s = tostring(s or ""):lower()
+    s = s:gsub("%W", "")
+    return s
+end
+
+local function isArmorName(name)
+    local n = normalizeName(name)
+    return n:find("fullarmor", 1, true) ~= nil
+end
+
+local function getCharacter()
+    local char = LocalPlayer.Character
+    if not char then return nil, nil, nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildWhichIsA("Humanoid")
+    if not hrp or not hum then return nil, nil, nil end
+    return char, hrp, hum
+end
+
+local function zeroMotion(hrp)
+    if not hrp then return end
+    pcall(function()
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end)
+end
+
+-- Server-confirmed teleport. Never teleport while Anchored: anchored moves land
+-- client-side only. Every attempt unanchors FIRST, moves, confirms, and leaves
+-- you unanchored. Callers re-freeze AFTER a confirmed arrival.
+local function serverTeleport(targetCF, tries, radius)
+    tries = tries or TP_TRIES
+    radius = radius or TP_RADIUS
+    for _ = 1, tries do
+        local char, hrp, hum = getCharacter()
+        if not char or not hrp then return false end
+        pcall(function()
+            if hum then hum.Sit = false end
+            if hrp.Anchored then hrp.Anchored = false end
+            zeroMotion(hrp)
+            char:PivotTo(targetCF)
+            hrp.CFrame = targetCF
+            zeroMotion(hrp)
+        end)
+        task.wait(TP_TICK)
+        local _, hrpNow = getCharacter()
+        if hrpNow and (hrpNow.Position - targetCF.Position).Magnitude <= radius then
+            for _ = 1, 2 do
+                local c2, h2 = getCharacter()
+                if not c2 or not h2 then break end
+                pcall(function()
+                    if h2.Anchored then h2.Anchored = false end
+                    c2:PivotTo(targetCF)
+                    h2.CFrame = targetCF
+                end)
+                task.wait()
+            end
+            return true
+        end
+    end
+    local _, hrpNow = getCharacter()
+    if hrpNow then
+        return (hrpNow.Position - targetCF.Position).Magnitude <= radius
+    end
+    return false
+end
+
+-- Finds Model named ~"Full Armor" (fuzzy) with a ClickDetector. Deprioritizes
+-- models that already failed us so we stop hammering one fried part.
+local function findArmorModel()
+    local best, bestClick, bestSubj, bestDist = nil, nil, nil, math.huge
+    local stale, staleClick, staleSubj, staleDist = nil, nil, nil, math.huge
+    local _, myHrp = getCharacter()
+    local myPos = myHrp and myHrp.Position or nil
+
+    for m, rec in pairs(modelFails) do
+        if typeof(m) ~= "Instance" or not m.Parent or os.clock() - rec.t > 120 then
+            modelFails[m] = nil
+        end
+    end
+
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("Model") and isArmorName(desc.Name) then
+            local click = desc:FindFirstChildWhichIsA("ClickDetector", true)
+            if click then
+                local rec = modelFails[desc]
+                local depri = rec ~= nil and rec.n >= MODEL_SKIP_FAILS
+                    and os.clock() - rec.t < MODEL_SKIP_S
+                local subj
+                local cp = click.Parent
+                if cp and cp:IsA("BasePart") then
+                    subj = cp
+                else
+                    subj = desc:FindFirstChildWhichIsA("Humanoid")
+                end
+                local pivot
+                pcall(function() pivot = desc:GetPivot().Position end)
+                if myPos and pivot then
+                    local d = (myPos - pivot).Magnitude
+                    if depri then
+                        if d < staleDist then
+                            stale, staleClick, staleSubj, staleDist = desc, click, subj, d
+                        end
+                    elseif d < bestDist then
+                        best, bestClick, bestSubj, bestDist = desc, click, subj, d
+                    end
+                elseif not depri and not best then
+                    best, bestClick, bestSubj = desc, click, subj
+                elseif depri and not stale then
+                    stale, staleClick, staleSubj = desc, click, subj
+                end
+            end
+        end
+    end
+    if not best and stale then
+        best, bestClick, bestSubj = stale, staleClick, staleSubj
+        warn("[autoarmor] only recently-failed models available - retrying one anyway")
+    end
+    return best, bestClick, bestSubj
+end
+
+-- Where the click is actually fired from, + its real range.
+local function getDetectorInfo(model, click)
+    local detPos
+    if click then
+        local p = click.Parent
+        if p and p:IsA("BasePart") then
+            detPos = p.Position
+        else
+            local cur = click.Parent
+            while cur and cur ~= model and cur ~= game do
+                if cur:IsA("BasePart") then detPos = cur.Position break end
+                cur = cur.Parent
+            end
+        end
+    end
+    if not detPos and model then
+        local ok, pivot = pcall(function() return model:GetPivot() end)
+        if ok and pivot then detPos = pivot.Position end
+    end
+    local maxDist = 10
+    if click then
+        pcall(function() maxDist = click.MaxActivationDistance end)
+    end
+    if type(maxDist) ~= "number" or maxDist <= 0 or maxDist > 100 then
+        maxDist = 32
+    end
+    return detPos, maxDist
+end
+
+-- Standable test for an HRP position. Anything solid (table/counter/shelf --
+-- model parts count, only YOU are excluded) at the torso fails it. Floor
+-- exactly at the feet passes (that's standing on it).
+local function isStandable(p)
+    local char = LocalPlayer.Character
+    local params = RaycastParams.new()
+    local okP = pcall(function()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        if char then params.FilterDescendantsInstances = { char } end
+        params.IgnoreWater = true
+    end)
+    if not okP then return false end
+    local downHit, upHit
+    pcall(function()
+        downHit = Workspace:Raycast(p, Vector3.new(0, -3.2, 0), params)
+    end)
+    pcall(function()
+        upHit = Workspace:Raycast(p, Vector3.new(0, 2.8, 0), params)
+    end)
+    local feetOk = (downHit == nil) or (downHit.Distance >= 3.0)
+    local headOk = (upHit == nil) or (upHit.Distance >= 2.6)
+    return feetOk and headOk
+end
+
+-- Hidden spot: DETECTOR XZ, straight down, first STANDABLE pocket. Never
+-- sideways, never inside solid. Solid columns return nil so the caller
+-- aborts/skips instead of looping into a table forever.
+local function getHiddenCFrame(model, click, returnCF)
+    local detPos, maxDist = getDetectorInfo(model, click)
+    if not detPos then return nil end
+    local allowed = math.max(4, maxDist - RANGE_MARGIN)
+    local maxDepth = math.min(UNDER_OFFSET, allowed)
+    local offset = 3.5
+    while offset <= maxDepth + 0.001 do
+        local p = detPos + Vector3.new(0, -offset, 0)
+        if isStandable(p) then
+            local rot = (returnCF - returnCF.Position)
+            return CFrame.new(p) * rot, detPos, maxDist
+        end
+        offset = offset + 0.5
+    end
+    return nil
+end
+
+local function freeze(hrp)
+    if hrp then pcall(function() hrp.Anchored = true end) end
+end
+
+local function unfreeze()
+    local _, hrp = getCharacter()
+    if hrp then pcall(function() hrp.Anchored = false end) end
+end
+
+local function viewSubject(subj)
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        if cam and subj then cam.CameraSubject = subj end
+    end)
+end
+
+-- Never return over void: raycast down from the saved spot, respect kill-plane.
+-- Returns: safeCFrame | nil (nil = void, do NOT teleport)
+local function resolveSafeReturn(returnCF)
+    if not returnCF then return nil end
+    local pos = returnCF.Position
+
+    local killY = -500
+    pcall(function() killY = Workspace.FallenPartsDestroyHeight end)
+    if pos.Y < killY + VOID_MARGIN then
+        return nil
+    end
+
+    local char = LocalPlayer.Character
+    local params = RaycastParams.new()
+    pcall(function()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        if char then params.FilterDescendantsInstances = { char } end
+        params.IgnoreWater = false
+    end)
+
+    local hit
+    pcall(function()
+        hit = Workspace:Raycast(pos + Vector3.new(0, 5, 0), Vector3.new(0, -GROUND_SCAN_DEPTH, 0), params)
+    end)
+    if not hit then
+        return nil
+    end
+
+    local groundY = hit.Position.Y
+    local _, hrpNow = getCharacter()
+    local lift = 5
+    if hrpNow then
+        pcall(function()
+            local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+            if hum and hum.HipHeight then
+                lift = hum.HipHeight + (hrpNow.Size.Y / 2) + 1
+            end
+        end)
+    end
+    if pos.Y - groundY > 60 then
+        return CFrame.new(Vector3.new(pos.X, groundY + lift, pos.Z)) * (returnCF - returnCF.Position)
+    end
+
+    return returnCF
+end
+
+-- Armor IntValue reader. Primary: workspace.Players.<you>.BodyEffects.Armor.
+-- Fallback: any IntValue with "armor" in the name under your player folder.
+local function getArmorObject()
+    local found
+    pcall(function()
+        local plrs = Workspace:FindFirstChild("Players")
+        local folder = plrs and plrs:FindFirstChild(LocalPlayer.Name)
+        local be = folder and folder:FindFirstChild("BodyEffects")
+        local a = be and be:FindFirstChild("Armor")
+        if a and a:IsA("IntValue") then found = a end
+    end)
+    if found then return found end
+    pcall(function()
+        local plrs = Workspace:FindFirstChild("Players")
+        local folder = plrs and plrs:FindFirstChild(LocalPlayer.Name)
+        if folder then
+            for _, d in ipairs(folder:GetDescendants()) do
+                if d:IsA("IntValue") and d.Name:lower():find("armor", 1, true) then
+                    found = d
+                    break
+                end
+            end
+        end
+    end)
+    return found
+end
+
+local function getArmorValue()
+    local a = getArmorObject()
+    if not a then return nil end
+    local v
+    pcall(function() v = a.Value end)
+    return v
+end
+
+local lastNoArmorWarn = 0
+local function buyOnce()
+    if buying then return end
+    if _G.autoarmorOff then return end
+    if os.clock() < lockoutUntil then return end
+
+    local v = getArmorValue()
+    if v == nil then
+        if os.clock() - lastNoArmorWarn > 10 then
+            lastNoArmorWarn = os.clock()
+            warn("[autoarmor] can't read Armor IntValue (workspace.Players."
+                .. LocalPlayer.Name .. ".BodyEffects.Armor)")
+        end
+        return
+    end
+    if v == ARMOR_TARGET then return end
+
+    local character, hrp = getCharacter()
+    if not character then return end
+
+    local armorModel, armorClick, armorSubj = findArmorModel()
+    if not armorModel then
+        warn("[autoarmor] no [Full Armor] model found (needs ClickDetector)")
+        noteFail(nil)
+        return
+    end
+
+    buying = true
+    local returnCF
+    pcall(function() returnCF = hrp.CFrame end)
+    local buyChar = character
+    local diedOrRespawned = false
+
+    local function cleanupAndReturn()
+        pcall(function()
+            local cam = Workspace.CurrentCamera
+            local _, _, h = getCharacter()
+            if cam and h then cam.CameraSubject = h end
+        end)
+        if diedOrRespawned or LocalPlayer.Character ~= buyChar then
+            warn("[autoarmor] died/respawned mid-buy - NOT returning to death spot")
+            pcall(function()
+                local _, newHrp = getCharacter()
+                if newHrp and newHrp.Anchored then
+                    newHrp.Anchored = false
+                end
+            end)
+            buying = false
+            return
+        end
+        pcall(function()
+            local cam = Workspace.CurrentCamera
+            local _, _, h = getCharacter()
+            if cam and h then cam.CameraSubject = h end
+        end)
+        local safeCF = resolveSafeReturn(returnCF)
+        if safeCF then
+            local placed = serverTeleport(safeCF, 6, TP_RADIUS)
+            if not placed then
+                warn("[autoarmor] return teleport did not replicate - staying at buy spot")
+            end
+            unfreeze()
+        else
+            warn("[autoarmor] return spot was over void - staying at buy spot")
+            pcall(function()
+                local _, newHrp = getCharacter()
+                if newHrp then zeroMotion(newHrp) end
+            end)
+            unfreeze()
+        end
+        buying = false
+    end
+
+    -- 1. standable pocket under the detector, server-confirmed, then FREEZE
+    local buySpotCF = nil
+    if returnCF then
+        local targetCF, spotDet = getHiddenCFrame(armorModel, armorClick, returnCF)
+        if targetCF then
+            if DEBUG_ARMOR then
+                print(("[autoarmor] spot target=%s det=%s dTargetDet=%.1f"):format(
+                    tostring(targetCF.Position),
+                    spotDet and tostring(spotDet) or "?",
+                    (spotDet and (targetCF.Position - spotDet).Magnitude) or -1))
+            end
+            if serverTeleport(targetCF, TP_TRIES, TP_RADIUS) then
+                buySpotCF = targetCF
+            else
+                warn("[autoarmor] buy teleport never replicated - aborting, will retry")
+                noteFail(armorModel)
+                buying = false
+                return
+            end
+        else
+            warn("[autoarmor] no standable pocket under detector - aborting")
+            noteFail(armorModel)
+            buying = false
+            return
+        end
+    end
+    character, hrp = getCharacter()
+    if not character then buying = false return end
+    if character ~= buyChar then buying = false return end
+    freeze(hrp)
+    zeroMotion(hrp)
+    task.wait()
+
+    -- 2. view it, 3. fire until Armor == 200
+    viewSubject(armorSubj)
+    if armorClick then
+        pcall(function() fireclickdetector(armorClick) end)
+    end
+
+    local t0 = os.clock()
+    local ok = false
+    while os.clock() - t0 < BUY_TIMEOUT do
+        local char2, hrp2 = getCharacter()
+        if not char2 or not hrp2 then diedOrRespawned = true break end
+        if char2 ~= buyChar then diedOrRespawned = true break end
+
+        local liveV = getArmorValue()
+        if liveV == ARMOR_TARGET then ok = true break end
+
+        -- secure: re-freeze if stripped, snap back if knocked far off the spot
+        if not hrp2.Anchored then
+            freeze(hrp2)
+            zeroMotion(hrp2)
+        end
+        if buySpotCF and (hrp2.Position - buySpotCF.Position).Magnitude > SECURE_RADIUS then
+            if serverTeleport(buySpotCF, 4, TP_RADIUS) then
+                local _, hrpBack = getCharacter()
+                if hrpBack then
+                    freeze(hrpBack)
+                    zeroMotion(hrpBack)
+                end
+            end
+        end
+
+        -- live range check vs FRESH detector position; move (standable) or abort
+        do
+            local detM = 10
+            pcall(function()
+                if armorClick then detM = armorClick.MaxActivationDistance end
+            end)
+            if type(detM) ~= "number" or detM <= 0 or detM > 100 then detM = 32 end
+            local detP
+            local dp = armorClick and armorClick.Parent or nil
+            if dp and dp:IsA("BasePart") then
+                detP = dp.Position
+            end
+            if detP then
+                local allowedLive = math.max(4, detM - RANGE_MARGIN)
+                if (hrp2.Position - detP).Magnitude > allowedLive then
+                    local newSpot = getHiddenCFrame(armorModel, armorClick, returnCF)
+                    if not newSpot then
+                        warn("[autoarmor] no standable pocket under detector - aborting")
+                        cleanupAndReturn()
+                        return
+                    end
+                    if serverTeleport(newSpot, TP_TRIES, TP_RADIUS) then
+                        buySpotCF = newSpot
+                        local _, hrpMv = getCharacter()
+                        if hrpMv then
+                            freeze(hrpMv)
+                            zeroMotion(hrpMv)
+                        end
+                    end
+                    task.wait(TICK)
+                    continue
+                end
+            end
+        end
+
+        if armorClick then
+            pcall(function() fireclickdetector(armorClick) end)
+        end
+        task.wait(TICK)
+    end
+
+    if diedOrRespawned then
+        warn("[autoarmor] interrupted by death/respawn - NOT returning")
+        failStreak = 0
+    elseif not ok then
+        warn("[autoarmor] buy timed out, returning anyway")
+        noteFail(armorModel)
+    else
+        noteSuccess()
+    end
+
+    cleanupAndReturn()
+    task.wait(BUY_DEBOUNCE)
+end
+
+-- INSTANT trigger: value hook fires the moment armor drops, no poll wait.
+local lastBuyTrig = 0
+local function hookArmor()
+    task.spawn(function()
+        local a = getArmorObject()
+        local t0 = os.clock()
+        while not a and os.clock() - t0 < 30 do
+            task.wait(1)
+            a = getArmorObject()
+        end
+        if not a then
+            warn("[autoarmor] Armor IntValue not found after 30s - poll loop only")
+            return
+        end
+        a.Changed:Connect(function(nv)
+            if buying then return end
+            if nv ~= ARMOR_TARGET then
+                if os.clock() - lastBuyTrig < 1 then return end
+                lastBuyTrig = os.clock()
+                task.spawn(function()
+                    pcall(buyOnce)
+                end)
+            end
+        end)
+    end)
+end
+
+LocalPlayer.CharacterAdded:Connect(function()
+    buying = false
+    failStreak = 0
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        local _, _, h = getCharacter()
+        if cam and h then cam.CameraSubject = h end
+    end)
+end)
+
+hookArmor()
+
+--// Auto loop (backup poll)
+task.spawn(function()
+    while true do
+        local ok, err = pcall(function()
+            if getArmorValue() ~= ARMOR_TARGET then
+                buyOnce()
+            end
+        end)
+        if not ok then warn("[autoarmor] loop error: " .. tostring(err)) end
+        task.wait(CHECK_INTERVAL)
+    end
+end)
+
+print("[autoarmor] loaded - watching armor value")
