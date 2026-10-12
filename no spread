@@ -1,0 +1,45 @@
+SpreadMod = {
+    BulletSpread = {
+        Enabled = false,
+        Amount = 100
+    },
+    ToggleKey = Enum.KeyCode.E 
+}
+
+local UserInputService = game:GetService("UserInputService")
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == SpreadMod.ToggleKey then
+        SpreadMod.BulletSpread.Enabled = not SpreadMod.BulletSpread.Enabled
+    end
+end)
+
+local old; old = hookfunction(math.random, function(...)
+    local args = {...}
+
+    if checkcaller() then
+        return old(...)
+    end
+
+    if (#args == 0) or 
+       (args[1] == -0.05 and args[2] == 0.05) or 
+       (args[1] == -0.1) or
+       (args[1] == -0.05) then
+
+        if SpreadMod.BulletSpread.Enabled then
+            local spread = SpreadMod.BulletSpread.Amount
+            return old(...) * (spread / 100)
+        else
+            return old(...)
+        end
+    end
+
+    return old(...)
+end)
+--or use this easy as hell
+
+
+hookfunction(math.random, function()
+    return 0
+end)
