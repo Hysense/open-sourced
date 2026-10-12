@@ -1,0 +1,21 @@
+local plr = game.Players.LocalPlayer
+
+local function rng()
+	for _,v in next,{plr.Backpack,plr.Character} do
+		if not v then continue end
+
+		for _,x in next,v:GetChildren() do
+			if x:IsA("Tool") and x:FindFirstChild("Range") then
+				x.Range.Value = 500000000000
+			end
+		end
+	end
+end
+
+rng()
+
+plr.Backpack.ChildAdded:Connect(rng)
+
+if plr.Character then
+	plr.Character.ChildAdded:Connect(rng)
+end
