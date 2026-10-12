@@ -1,0 +1,987 @@
+-- autostim.lua | AutoHeal System
+-- Teleport under stim -> FREEZE -> view/click/equip+activate -> wait full HP -> UNFREEZE -> teleport back
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+--// Config
+local CHECK_INTERVAL = 0.1 -- backup poll (damage hook below is the instant trigger)
+local HEAL_TIMEOUT = 10
+local UNDER_OFFSET = 7 -- studs below model bottom, deep enough to be fully under / hidden by it
+local HEAL_DEBOUNCE = 0.5 -- seconds between heals
+local DO_CLICKDETECTOR = true
+local DO_TOOL = true
+local TICK = 0.1 -- fast equip/activate retry rate
+local RANGE_MARGIN = 3 -- stay this many studs inside MaxActivationDistance
+local VOID_MARGIN = 25 -- treat anything this far above kill-plane as void-adjacent
+local GROUND_SCAN_DEPTH = 2000 -- how far down to look for ground when validating return
+local SECURE_RADIUS = 10 -- if knocked/flung further than this from heal spot, snap back
+local TP_TRIES = 6 -- teleport replication attempts (first set lands instantly, rest confirm)
+local TP_TICK = 0.1 -- wait between teleport attempts (must exceed network round-trip or confirms lie)
+local TP_RADIUS = 5 -- must confirm within this many studs or it's not a real teleport
+local SETTLE_TICKS = 2 -- stable ticks after a knock before trusting a teleport (ragdoll releases late server-side)
+local WAKE_ROUNDS = 3 -- placement rounds per recovery pass
+local HOLD_RADIUS = 5 -- must still be here after two beats: proves the server (not just the client) took us
+local WAKE_MAX_S = 12 -- max seconds one recovery pass may spend placing
+local FAIL_LOCKOUT_FAILS = 3 -- consecutive failed heals before cooling down
+local FAIL_LOCKOUT_S = 15 -- cooldown seconds (stops teleport-spam loops)
+local MODEL_SKIP_FAILS = 2 -- failures on one model before trying a different one
+local MODEL_SKIP_S = 60 -- how long a failed model stays deprioritized
+local HEAD_UP_MIN = 0.9 -- head's thinnest axis must be this vertical (|worldY|): biggest face skyward
+local HEAD_SUPPORT_DEPTH = 6 -- studs below the head to look for its shelf/counter/floor
+local DEBUG_STIM = true -- print per-model diagnostics (orientation/size/checks) to tune the whitelist
+
+local healing = false
+local stimDbgAt = {} -- model -> last os.clock() we printed diagnostics for
+local failStreak = 0 -- consecutive failed heals (circuit breaker)
+local lockoutUntil = 0 -- os.clock() timestamp: no heals before this
+local modelFails = {} -- model -> {n, t}: per-spot failure memory
+
+-- Circuit breaker: repeated failures (bad spot, server rejecting us) cool down
+-- instead of teleport-spamming the same part until physics explodes.
+-- Emergency stop without rejoining: run `_G.autostimOff = true`.
+local function noteFail(model)
+    failStreak = failStreak + 1
+    if model then
+        local rec = modelFails[model] or { n = 0, t = 0 }
+        rec.n = rec.n + 1
+        rec.t = os.clock()
+        modelFails[model] = rec
+    end
+    if failStreak >= FAIL_LOCKOUT_FAILS then
+        lockoutUntil = os.clock() + FAIL_LOCKOUT_S
+        failStreak = 0
+        warn("[autostim] failing repeatedly - cooling down "
+            .. FAIL_LOCKOUT_S .. "s (run _G.autostimOff=true to stop)")
+    end
+end
+
+local function noteSuccess()
+    failStreak = 0
+end
+
+--// Helpers
+
+local function normalizeName(s)
+    s = tostring(s or ""):lower()
+    s = s:gsub("%W", "")
+    return s
+end
+
+local function isStimName(name)
+    return normalizeName(name):find("stim", 1, true) ~= nil
+end
+
+local function getCharacter()
+    local char = LocalPlayer.Character
+    if not char then return nil, nil, nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildWhichIsA("Humanoid")
+    if not hrp or not hum then return nil, nil, nil end
+    return char, hrp, hum
+end
+
+-- Down/ragdolled check: true while we cannot act (ragdoll, physics, platformstand, dead).
+local function isDown(hum)
+    if not hum then return true end
+    local dead = false
+    pcall(function() dead = hum.Health <= 0 end)
+    if dead then return true end
+    local plat = false
+    pcall(function() plat = hum.PlatformStand end)
+    if plat then return true end
+    local st = nil
+    pcall(function() st = hum:GetState() end)
+    if st == Enum.HumanoidStateType.Ragdoll
+        or st == Enum.HumanoidStateType.FallingDown
+        or st == Enum.HumanoidStateType.Physics then
+        return true
+    end
+    return false
+end
+
+local function zeroMotion(hrp)
+    if not hrp then return end
+    pcall(function()
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end)
+end
+
+-- Server-confirmed teleport. Setting CFrame once is NOT enough: the client can
+-- look teleported while the server still has you at the old spot (then the buy
+-- fails / clicks do nothing). Push several frames via PivotTo + HRP and confirm.
+-- CRITICAL: never teleport while Anchored. An anchored HRP is server-authoritative:
+-- CFrame sets land client-side only and the server keeps you at the old spot.
+-- So every attempt unanchors FIRST, moves, confirms, and leaves you unanchored.
+-- Callers re-freeze AFTER a confirmed arrival. Returns true only if live
+-- position is actually at the target.
+local function serverTeleport(targetCF, tries, radius)
+    tries = tries or TP_TRIES
+    radius = radius or TP_RADIUS
+    for _ = 1, tries do
+        local char, hrp, hum = getCharacter()
+        if not char or not hrp then return false end
+        pcall(function()
+            if hum then hum.Sit = false end
+            if hrp.Anchored then hrp.Anchored = false end -- must move unanchored or server ignores it
+            zeroMotion(hrp)
+            char:PivotTo(targetCF)
+            hrp.CFrame = targetCF
+            zeroMotion(hrp)
+        end)
+        task.wait(TP_TICK)
+        local _, hrpNow = getCharacter()
+        if hrpNow and (hrpNow.Position - targetCF.Position).Magnitude <= radius then
+            -- extra pushes so the server actually holds us there (still unanchored)
+            for _ = 1, 2 do
+                local c2, h2 = getCharacter()
+                if not c2 or not h2 then break end
+                pcall(function()
+                    if h2.Anchored then h2.Anchored = false end
+                    c2:PivotTo(targetCF)
+                    h2.CFrame = targetCF
+                end)
+                task.wait()
+            end
+            return true
+        end
+    end
+    local _, hrpNow = getCharacter()
+    if hrpNow then
+        return (hrpNow.Position - targetCF.Position).Magnitude <= radius
+    end
+    return false
+end
+
+-- Exact world-space underside of a part (rotation-aware). Size.Y/2 is wrong for
+-- tipped parts: teleporting to it lands you inside the part and the server
+-- ejects you somewhere far away.
+local function partBottomY(part)
+    local cf, size
+    pcall(function() cf = part.CFrame size = part.Size end)
+    if not cf or not size then
+        local p
+        pcall(function() p = part.Position end)
+        return p and (p.Y - 2) or 0
+    end
+    local ey = (size.X * math.abs(cf.RightVector.Y)
+        + size.Y * math.abs(cf.UpVector.Y)
+        + size.Z * math.abs(cf.LookVector.Y)) / 2
+    return cf.Y - ey
+end
+
+local function getStimHead(model)
+    local head
+    pcall(function() head = model:FindFirstChild("Head") end)
+    if head and head:IsA("BasePart") then return head end
+    return nil
+end
+
+-- Biggest face skyward: the head's thinnest local axis must point world-vertical.
+-- A correctly placed item has its two biggest faces split: one up at the sky,
+-- one down onto its shelf. A tipped item fails even if its numbers look close.
+local function headFlatSkywardOk(head)
+    if not head then return false end
+    local size = head.Size
+    local cf
+    pcall(function() cf = head.CFrame end)
+    if not cf then return false end
+    local worldAxis
+    if size.Y <= size.X and size.Y <= size.Z then
+        worldAxis = cf.UpVector
+    elseif size.X <= size.Y and size.X <= size.Z then
+        worldAxis = cf.RightVector
+    else
+        worldAxis = cf.LookVector
+    end
+    return math.abs(worldAxis.Y) >= HEAD_UP_MIN
+end
+
+-- Resting on a part: one face sits on its shelf/counter (or the floor).
+-- Short ray straight down from under the head; anything solid counts except you.
+-- Sibling model parts count too, so in-model stands don't false-fail.
+local function headSupportedOk(head)
+    if not head then return false end
+    local char = LocalPlayer.Character
+    local params = RaycastParams.new()
+    local okParams = pcall(function()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local t = { head }
+        if char then table.insert(t, char) end
+        params.FilterDescendantsInstances = t
+        params.IgnoreWater = true
+    end)
+    if not okParams then return false end
+    local origin, dir
+    pcall(function()
+        origin = head.Position - Vector3.new(0, (head.Position.Y - partBottomY(head)) + 0.5, 0)
+        dir = Vector3.new(0, -HEAD_SUPPORT_DEPTH, 0)
+    end)
+    if not origin then return false end
+    local hit
+    pcall(function() hit = Workspace:Raycast(origin, dir, params) end)
+    return hit ~= nil
+end
+
+-- Full validity of a heal target. Used for selection AND re-validation mid-heal:
+-- if the model we're under stops passing (rotated/moved), we drop it.
+local function isStimModelValid(model)
+    if not model or not model.Parent then return false end
+    if not isStimName(model.Name) then return false end
+    if not model:FindFirstChildWhichIsA("Humanoid") then return false end
+    if not model:FindFirstChildWhichIsA("ClickDetector", true) then return false end
+    local head = getStimHead(model)
+    if not head then return false end
+    if not headFlatSkywardOk(head) then return false end
+    if not headSupportedOk(head) then return false end
+    return true
+end
+
+local function findStimModel()
+    local best, bestHum, bestClick, bestDist = nil, nil, nil, math.huge
+    local stale, staleHum, staleClick, staleDist = nil, nil, nil, math.huge
+    local _, myHrp = getCharacter()
+    local myPos = myHrp and myHrp.Position or nil
+    local rejected = 0
+
+    -- forget dead models / old failures
+    for m, rec in pairs(modelFails) do
+        if typeof(m) ~= "Instance" or not m.Parent or os.clock() - rec.t > 120 then
+            modelFails[m] = nil
+        end
+    end
+
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("Model") and isStimName(desc.Name) then
+            local hum = desc:FindFirstChildWhichIsA("Humanoid")
+            if hum then
+                local click = desc:FindFirstChildWhichIsA("ClickDetector", true)
+                if click then
+                    -- only rule: a biggest side of the Head faces up (other face
+                    -- onto its shelf), plus something solid under it. Then teleport
+                    -- under it and grab it. Rotation numbers don't matter.
+                    local head = getStimHead(desc)
+                    local flatOk = head ~= nil and headFlatSkywardOk(head)
+                    local supOk = flatOk and headSupportedOk(head)
+                    if DEBUG_STIM then
+                        local now = os.clock()
+                        if not stimDbgAt[desc] or now - stimDbgAt[desc] > 10 then
+                            stimDbgAt[desc] = now
+                            local oStr, sStr = "no-Head", "?"
+                            if head then
+                                pcall(function()
+                                    oStr = string.format("%.1f,%.1f,%.1f",
+                                        head.Orientation.X, head.Orientation.Y, head.Orientation.Z)
+                                    sStr = string.format("%.1f,%.1f,%.1f",
+                                        head.Size.X, head.Size.Y, head.Size.Z)
+                                end)
+                            end
+                            print(("[autostim] candidate '%s' headOri=(%s) size=(%s) flat=%s sup=%s"):format(
+                                desc.Name, oStr, sStr, tostring(flatOk), tostring(supOk)))
+                        end
+                    end
+                    if flatOk and supOk then
+                        -- deprioritize models that already failed us recently so we
+                        -- stop hammering the same fried part; stale is last resort
+                        local rec = modelFails[desc]
+                        local depri = rec ~= nil and rec.n >= MODEL_SKIP_FAILS
+                            and os.clock() - rec.t < MODEL_SKIP_S
+                        local pivot
+                        pcall(function() pivot = desc:GetPivot().Position end)
+                        if not pivot then
+                            local r = desc:FindFirstChild("HumanoidRootPart")
+                            if r and r:IsA("BasePart") then pivot = r.Position end
+                        end
+                        if myPos and pivot then
+                            local d = (myPos - pivot).Magnitude
+                            if depri then
+                                if d < staleDist then
+                                    stale, staleHum, staleClick, staleDist = desc, hum, click, d
+                                end
+                            elseif d < bestDist then
+                                best, bestHum, bestClick, bestDist = desc, hum, click, d
+                            end
+                        elseif not depri and not best then
+                            best, bestHum, bestClick = desc, hum, click
+                        elseif depri and not stale then
+                            stale, staleHum, staleClick = desc, hum, click
+                        end
+                    else
+                        rejected = rejected + 1
+                    end
+                end
+            end
+        end
+    end
+    if not best and stale then
+        best, bestHum, bestClick = stale, staleHum, staleClick
+        warn("[autostim] only recently-failed models available - retrying one anyway")
+    end
+    if not best and rejected > 0 then
+        warn("[autostim] skipped " .. rejected .. " stim model(s): biggest Head face not skyward or nothing under it - see candidate lines above")
+    end
+    return best, bestHum, bestClick
+end
+
+local function scanForTool(parent)
+    if not parent then return nil end
+    for _, child in ipairs(parent:GetChildren()) do
+        if child:IsA("Tool") and isStimName(child.Name) then
+            return child
+        end
+    end
+    for _, child in ipairs(parent:GetDescendants()) do
+        if child:IsA("Tool") and isStimName(child.Name) then
+            return child
+        end
+    end
+    return nil
+end
+
+-- Always re-scan live: picks up manual equips, respawned tools, consumed/re-given tools.
+local function findStimTool()
+    local char = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    return scanForTool(char) or scanForTool(backpack)
+end
+
+-- Where the click is actually fired from, + its real range.
+local function getDetectorInfo(stimModel, stimClick)
+    local detPos
+    if stimClick then
+        -- ClickDetector's parent is normally the part you click
+        local p = stimClick.Parent
+        if p and p:IsA("BasePart") then
+            detPos = p.Position
+        else
+            -- climb to nearest part (handles detectors nested in models/folders)
+            local cur = stimClick.Parent
+            while cur and cur ~= stimModel and cur ~= game do
+                if cur:IsA("BasePart") then detPos = cur.Position break end
+                cur = cur.Parent
+            end
+        end
+    end
+    if not detPos and stimModel then
+        local ok, pivot = pcall(function() return stimModel:GetPivot() end)
+        if ok and pivot then detPos = pivot.Position end
+    end
+    local maxDist = 10
+    if stimClick then
+        pcall(function() maxDist = stimClick.MaxActivationDistance end)
+    end
+    if type(maxDist) ~= "number" or maxDist <= 0 or maxDist > 100 then
+        maxDist = 32 -- executor / misconfigured fallback
+    end
+    return detPos, maxDist
+end
+
+-- Standable test for an HRP position: feet ~3 below, head ~2 above. Anything
+-- solid (table, counter, shelf -- model parts count, only YOU are excluded) at
+-- the torso fails it. Floor exactly at the feet passes (that's standing on it).
+local function isStandable(p)
+    local char = LocalPlayer.Character
+    local params = RaycastParams.new()
+    local okP = pcall(function()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        if char then params.FilterDescendantsInstances = { char } end
+        params.IgnoreWater = true
+    end)
+    if not okP then return false end
+    local downHit, upHit
+    pcall(function()
+        downHit = Workspace:Raycast(p, Vector3.new(0, -3.2, 0), params)
+    end)
+    pcall(function()
+        upHit = Workspace:Raycast(p, Vector3.new(0, 2.8, 0), params)
+    end)
+    local feetOk = (downHit == nil) or (downHit.Distance >= 3.0)
+    local headOk = (upHit == nil) or (upHit.Distance >= 2.6)
+    return feetOk and headOk
+end
+
+-- Hidden spot: DETECTOR XZ, straight down, first STANDABLE pocket.
+-- The detector is mandatory: never sideways, never inside solid. Shallow first
+-- ("a little more down"), capped by range ("not too far"). A solid column
+-- returns nil so the caller aborts/skips instead of looping into a table forever.
+local function getHiddenCFrame(model, stimClick, returnCF)
+    local detPos, maxDist = getDetectorInfo(model, stimClick)
+    -- no detector, no spot: refuse to teleport anywhere rather than guess
+    if not detPos then return nil end
+    local allowed = math.max(4, maxDist - RANGE_MARGIN)
+    local maxDepth = math.min(UNDER_OFFSET, allowed)
+    local offset = 3.5
+    while offset <= maxDepth + 0.001 do
+        local p = detPos + Vector3.new(0, -offset, 0)
+        if isStandable(p) then
+            local rot = (returnCF - returnCF.Position)
+            return CFrame.new(p) * rot, detPos, maxDist
+        end
+        offset = offset + 0.5
+    end
+    return nil
+end
+
+-- Fast, non-blocking equip. No long waits: caller retries every TICK.
+local function tryEquipFast(tool, humanoid, character)
+    if not tool or not humanoid or not character then return false end
+    if tool.Parent == character then return true end
+    pcall(function() tool.Enabled = true end)
+    pcall(function() humanoid:EquipTool(tool) end)
+    if tool.Parent ~= character then
+        pcall(function() tool.Parent = character end)
+    end
+    return tool.Parent == character
+end
+
+-- Direct activation only: no simulated mouse clicks.
+-- Tool path uses Tool:Activate(), model path uses fireclickdetector().
+local function strongActivate(tool)
+    if not tool then return end
+    pcall(function() tool.Enabled = true end)
+    pcall(function() tool:Activate() end)
+end
+
+local function freeze(hrp)
+    if hrp then pcall(function() hrp.Anchored = true end) end
+end
+
+local function unfreeze()
+    local _, hrp = getCharacter()
+    if hrp then pcall(function() hrp.Anchored = false end) end
+end
+
+-- Camera onto the Head part itself (falls back to the model humanoid).
+local function viewTarget(model, fallbackHum)
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        if not cam then return end
+        local head = model and getStimHead(model) or nil
+        if head then
+            cam.CameraSubject = head
+        elseif fallbackHum then
+            cam.CameraSubject = fallbackHum
+        end
+    end)
+end
+
+-- Never return over void: raycast down from the saved spot, respect kill-plane.
+-- Returns: safeCFrame | nil (nil = void, do NOT teleport)
+local function resolveSafeReturn(returnCF)
+    if not returnCF then return nil end
+    local pos = returnCF.Position
+
+    -- below / near kill-plane = certain void
+    local killY = -500
+    pcall(function() killY = Workspace.FallenPartsDestroyHeight end)
+    if pos.Y < killY + VOID_MARGIN then
+        return nil
+    end
+
+    local char = LocalPlayer.Character
+    local params = RaycastParams.new()
+    pcall(function()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        if char then params.FilterDescendantsInstances = { char } end
+        params.IgnoreWater = false
+    end)
+
+    -- direct column under saved spot: any ground at all?
+    local hit
+    pcall(function()
+        hit = Workspace:Raycast(pos + Vector3.new(0, 5, 0), Vector3.new(0, -GROUND_SCAN_DEPTH, 0), params)
+    end)
+    if not hit then
+        return nil -- no ground within range below = over void, refuse
+    end
+
+    -- ground exists: if we saved mid-air (jump/fall), snap onto it instead of
+    -- re-appearing mid-air over nothing and falling through
+    local groundY = hit.Position.Y
+    local _, hrpNow = getCharacter()
+    local lift = 5
+    if hrpNow then
+        pcall(function()
+            local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+            if hum and hum.HipHeight then
+                lift = hum.HipHeight + (hrpNow.Size.Y / 2) + 1
+            end
+        end)
+    end
+    if pos.Y - groundY > 60 then
+        -- saved spot is far above ground (fell during heal / bad save): land it
+        return CFrame.new(Vector3.new(pos.X, groundY + lift, pos.Z)) * (returnCF - returnCF.Position)
+    end
+
+    return returnCF
+end
+
+local function healOnce()
+    if healing then return end
+    if _G.autostimOff then return end
+    if os.clock() < lockoutUntil then return end
+    local character, hrp, myHum = getCharacter()
+    if not character then return end
+    if myHum.Health == myHum.MaxHealth then return end
+
+    local stimModel, stimHum, stimClick = findStimModel()
+    if not stimModel then
+        warn("[autostim] no [Stim] model found")
+        return
+    end
+
+    -- findStimModel already whitelisted this target: Head at 180,0,0,
+    -- lying flat with its biggest face skyward, resting on the ground.
+    -- Nothing is ever rotated; bad models are skipped, not fixed.
+
+    -- pre-grab tool BEFORE teleport so equip is instant after freeze
+    local stimTool = findStimTool()
+
+    healing = true
+    local returnCF
+    pcall(function() returnCF = hrp.CFrame end)
+    local healChar = character -- identity of the body we took. Respawn = new body = do NOT return.
+    local diedOrRespawned = false
+
+    local function cleanupAndReturn()
+        -- camera first (safe while still frozen)
+        pcall(function()
+            local cam = Workspace.CurrentCamera
+            local _, _, h = getCharacter()
+            if cam and h then cam.CameraSubject = h end
+        end)
+        -- stomped/respawned mid-heal: NEVER carry the fresh body back to the death spot.
+        -- That turns autoheal into a respawn-to-death-spot trap.
+        if diedOrRespawned or LocalPlayer.Character ~= healChar then
+            warn("[autostim] died/respawned mid-heal - NOT returning to death spot")
+            pcall(function()
+                local _, newHrp = getCharacter()
+                if newHrp and newHrp.Anchored then
+                    newHrp.Anchored = false
+                end
+            end)
+            healing = false
+            return
+        end
+        -- camera first (safe while still frozen)
+        pcall(function()
+            local cam = Workspace.CurrentCamera
+            local _, _, h = getCharacter()
+            if cam and h then cam.CameraSubject = h end
+        end)
+        -- validate return spot BEFORE letting go: never return over void.
+        -- Return teleport runs UNANCHORED so the server actually takes it
+        -- (anchored moves replicate client-side only), then control is handed back.
+        -- Same body only (respawn already returned above).
+        local safeCF = resolveSafeReturn(returnCF)
+        if safeCF then
+            local placed = serverTeleport(safeCF, 6, TP_RADIUS)
+            if not placed then
+                warn("[autostim] return teleport did not replicate - staying secured at heal spot")
+            end
+            unfreeze() -- no-op: teleport already runs unanchored; ensures control back
+        else
+            -- return was void: refuse the teleport, drop in place under cover instead of dying
+            warn("[autostim] return spot was over void - staying at heal spot")
+            pcall(function()
+                local _, newHrp = getCharacter()
+                if newHrp then zeroMotion(newHrp) end
+            end)
+            unfreeze()
+        end
+        healing = false
+    end
+
+    -- 1. teleport fully under / under cover, then FREEZE instantly.
+    -- Must CONFIRM: one CFrame set can look done locally while the server
+    -- still has us at the old spot (buy then fails in a fake-teleport loop).
+    local healSpotCF = nil
+    if returnCF then
+        local targetCF, spotDet = getHiddenCFrame(stimModel, stimClick, returnCF)
+        if targetCF then
+            if DEBUG_STIM then
+                local spotHead = getStimHead(stimModel)
+                print(("[autostim] spot target=%s head=%s det=%s dTargetDet=%.1f"):format(
+                    tostring(targetCF.Position),
+                    spotHead and tostring(spotHead.Position) or "?",
+                    spotDet and tostring(spotDet) or "?",
+                    (spotDet and (targetCF.Position - spotDet).Magnitude) or -1))
+            end
+            if serverTeleport(targetCF, TP_TRIES, TP_RADIUS) then
+                healSpotCF = targetCF
+                if DEBUG_STIM then
+                    local _, hrpArr = getCharacter()
+                    print(("[autostim] arrived=%s dArrDet=%.1f"):format(
+                        tostring(hrpArr and hrpArr.Position),
+                        (hrpArr and spotDet and (hrpArr.Position - spotDet).Magnitude) or -1))
+                end
+            else
+                warn("[autostim] heal teleport never replicated - aborting, will retry")
+                noteFail(stimModel)
+                healing = false
+                return
+            end
+        else
+            -- no standable pocket (solid table all the way down / out of range):
+            -- teleporting anyway would loop forever, so abort and skip this model
+            warn("[autostim] no standable pocket under detector - aborting")
+            noteFail(stimModel)
+            healing = false
+            return
+        end
+    end
+    character, hrp, myHum = getCharacter()
+    if not character then healing = false return end
+    if character ~= healChar then healing = false return end -- respawned during teleport
+    freeze(hrp)
+    zeroMotion(hrp)
+    task.wait() -- one frame so anchor replicates before we act
+
+    -- HARD CHECK: if we're somehow out of click range, re-run the standable
+    -- search (never an arithmetic guess that can land inside the table).
+    -- Teleport runs UNANCHORED (anchored moves don't replicate), then re-freeze.
+    pcall(function()
+        local detPos, maxDist = getDetectorInfo(stimModel, stimClick)
+        if detPos and hrp then
+            local allowedNow = math.max(4, maxDist - RANGE_MARGIN)
+            local dNow = (hrp.Position - detPos).Magnitude
+            if dNow > allowedNow then
+                local fixed = getHiddenCFrame(stimModel, stimClick, hrp.CFrame)
+                if fixed and serverTeleport(fixed, 6, TP_RADIUS) then
+                    local _, hrpFixed = getCharacter()
+                    if hrpFixed then
+                        freeze(hrpFixed)
+                        zeroMotion(hrpFixed)
+                    end
+                end
+            end
+        end
+    end)
+
+    -- re-validate the OWNED target (never switch mid-heal: this run owns its
+    -- triple from selection, so spot and click can never disagree with each other).
+    if not isStimModelValid(stimModel) then
+        warn("[autostim] target failed whitelist re-check - aborting")
+        noteFail(stimModel)
+        cleanupAndReturn()
+        return
+    end
+    stimTool = findStimTool() or stimTool
+
+    -- 2. view the Head part
+    viewTarget(stimModel, stimHum)
+
+    -- 3. fire clickdetector (still frozen under it, in range)
+    if DO_CLICKDETECTOR and stimClick then
+        pcall(function() fireclickdetector(stimClick) end)
+    end
+
+    -- 4+5. FAST equip + activate loop. Re-scans every tick so:
+    --  - slow backpack replication still gets equipped the moment it appears
+    --  - manual equips get activated for you
+    --  - games that unequip after each use get re-equipped instantly
+    character, hrp, myHum = getCharacter()
+    if stimTool and myHum then
+        tryEquipFast(stimTool, myHum, character)
+    end
+
+    local t0 = os.clock()
+    local ok = false
+    local wasDown = false -- latched while knocked: wake-up forces full re-secure
+    local wakeStable = 0 -- consecutive stable ticks (ragdoll releases late server-side)
+    local lastValidCheck = os.clock()
+    while os.clock() - t0 < HEAL_TIMEOUT do
+        local char2, hrp2, h = getCharacter()
+        if not h or not char2 or not hrp2 then diedOrRespawned = true break end
+        if char2 ~= healChar then diedOrRespawned = true break end -- respawned: new body
+        if h.Health <= 0 then diedOrRespawned = true break end -- stomped: abort, never return
+        if h.Health == h.MaxHealth then ok = true break end
+
+        -- SECURE: re-freeze if anything (ragdoll script, physics) stripped our anchor
+        if not hrp2.Anchored then
+            freeze(hrp2)
+            zeroMotion(hrp2)
+        end
+
+        -- INTERRUPTED (ragdolled/stunned): hold secured, do NOT burn timeout
+        -- and do NOT teleport back hurt. Resume healing once we're up.
+        if isDown(h) then
+            wasDown = true
+            wakeStable = 0
+            t0 = t0 + TICK -- pause timeout while down
+            -- keep the pin while down so we don't drift either.
+            -- Teleport runs unanchored (anchored moves don't replicate), then re-freeze.
+            if healSpotCF and (hrp2.Position - healSpotCF.Position).Magnitude > SECURE_RADIUS then
+                if serverTeleport(healSpotCF, 4, TP_RADIUS) then
+                    local _, hrpPinned = getCharacter()
+                    if hrpPinned then
+                        freeze(hrpPinned)
+                        zeroMotion(hrpPinned)
+                    end
+                end
+            end
+            task.wait(TICK)
+            continue
+        end
+
+        wakeStable = wakeStable + 1
+
+        -- VULNERABLE WINDOW (just got up, or drifted): loop EVERYTHING before
+        -- any heal action. You can't teleport while ragdolled, and the first
+        -- "stable" tick often still belongs to the server-side ragdoll: any move
+        -- made then is client-side only. So we settle, then place in rounds and
+        -- prove the server kept us (hold check) before firing anything.
+        local needSecure = wasDown
+            or (healSpotCF and (hrp2.Position - healSpotCF.Position).Magnitude > TP_RADIUS)
+        if needSecure then
+            local rStart = os.clock()
+            -- owned-target check: this run owns its triple from selection and never
+            -- switches mid-heal (switching desyncs spot and click onto different
+            -- models). If it went bad, abort and let the outer loop re-pick fresh.
+            if not isStimModelValid(stimModel) then
+                warn("[autostim] target failed whitelist - aborting heal")
+                noteFail(stimModel)
+                cleanupAndReturn()
+                return
+            end
+            local confirmed = false
+            -- settle first: no teleport until the ragdoll is truly over
+            local settled = (not wasDown) or (wakeStable >= SETTLE_TICKS)
+            if healSpotCF and settled then
+                for _ = 1, WAKE_ROUNDS do
+                    -- died/respawned mid-recovery: stop immediately, never return
+                    local rc, _, rh = getCharacter()
+                    if not rh or not rc or rc ~= healChar or rh.Health <= 0 then
+                        diedOrRespawned = true
+                        break
+                    end
+                    if rh.Health == rh.MaxHealth then confirmed = true break end
+                    if serverTeleport(healSpotCF, TP_TRIES, TP_RADIUS) then
+                        local _, hrpBack = getCharacter()
+                        if hrpBack then
+                            freeze(hrpBack)
+                            zeroMotion(hrpBack)
+                        end
+                        -- hold check, twice: a client-only teleport passes the first
+                        -- read and fails here when the server yanks us back
+                        task.wait(0.25)
+                        local _, h1 = getCharacter()
+                        if h1 and (h1.Position - healSpotCF.Position).Magnitude <= HOLD_RADIUS then
+                            task.wait(0.25)
+                            local _, h2 = getCharacter()
+                            if h2 and (h2.Position - healSpotCF.Position).Magnitude <= HOLD_RADIUS then
+                                confirmed = true
+                                break
+                            end
+                        end
+                    end
+                    if os.clock() - rStart > WAKE_MAX_S then break end
+                end
+            end
+            -- re-clamp via the standable search (knock may have moved things)
+            pcall(function()
+                local _, hrpNow = getCharacter()
+                local detPos, maxDist = getDetectorInfo(stimModel, stimClick)
+                if detPos and hrpNow then
+                    local allowedNow = math.max(4, maxDist - RANGE_MARGIN)
+                    if (hrpNow.Position - detPos).Magnitude > allowedNow then
+                        local fixed = getHiddenCFrame(stimModel, stimClick, hrpNow.CFrame)
+                        if fixed and serverTeleport(fixed, 6, TP_RADIUS) then
+                            confirmed = true
+                            local _, hrpFixed = getCharacter()
+                            if hrpFixed then
+                                freeze(hrpFixed)
+                                zeroMotion(hrpFixed)
+                            end
+                        end
+                    end
+                end
+            end)
+            -- re-pin camera (Head part) + tool the moment we're up, before firing anything
+            viewTarget(stimModel, stimHum)
+            stimTool = findStimTool()
+            if stimTool then
+                local cc, _, hh2 = getCharacter()
+                if cc and hh2 then tryEquipFast(stimTool, hh2, cc) end
+            end
+            -- recovery time never burns heal timeout; only real attempts do
+            t0 = t0 + (os.clock() - rStart)
+            if diedOrRespawned then
+                cleanupAndReturn()
+                return
+            end
+            if not confirmed then
+                -- still not verifiably placed (or still settling): stay vulnerable,
+                -- retry next tick, do NOT fire clicks into the void
+                wasDown = true -- keep looping the full sequence
+                task.wait(TICK)
+                continue
+            end
+            wasDown = false
+            wakeStable = 0
+        end
+
+        -- LIVE TARGET TRACKING: the owned model can walk. Check FRESH detector
+        -- position every tick (no scan, just re-read the part). If it walked off
+        -- or our spot went stale, recompute under the live head and move before
+        -- firing anything. Never fire from a stale spot.
+        do
+            local detM = 10
+            pcall(function()
+                if stimClick then detM = stimClick.MaxActivationDistance end
+            end)
+            if type(detM) ~= "number" or detM <= 0 or detM > 100 then detM = 32 end
+            local detP
+            local dp = stimClick and stimClick.Parent or nil
+            if dp and dp:IsA("BasePart") then
+                detP = dp.Position
+            else
+                local lh = stimModel and getStimHead(stimModel) or nil
+                if lh then detP = lh.Position end
+            end
+            if detP then
+                local allowedLive = math.max(4, detM - RANGE_MARGIN)
+                if (hrp2.Position - detP).Magnitude > allowedLive then
+                    -- too far from the live detector: model walked, or spot stale
+                    if healSpotCF and (detP - healSpotCF.Position).Magnitude > 60 then
+                        -- model relocated across the map (moved/respawned): abort,
+                        -- outer loop re-picks instead of chasing it forever
+                        warn("[autostim] owned model moved far away - aborting heal")
+                        cleanupAndReturn()
+                        return
+                    end
+                    local mvStart = os.clock()
+                    local newSpot = getHiddenCFrame(stimModel, stimClick, returnCF)
+                    if not newSpot then
+                        -- solid column now (or detector gone): abort once and let
+                        -- the breaker count it + the picker skip this model
+                        warn("[autostim] no standable pocket under detector - aborting")
+                        cleanupAndReturn()
+                        return
+                    end
+                    do
+                        if serverTeleport(newSpot, TP_TRIES, TP_RADIUS) then
+                            healSpotCF = newSpot
+                            local _, hrpMv = getCharacter()
+                            if hrpMv then
+                                freeze(hrpMv)
+                                zeroMotion(hrpMv)
+                            end
+                            if DEBUG_STIM then
+                                print(("[autostim] re-targeted to %s (model walked)"):format(
+                                    tostring(newSpot.Position)))
+                            end
+                        end
+                    end
+                    t0 = t0 + (os.clock() - mvStart)
+                    task.wait(TICK)
+                    continue -- re-verify next tick; never fire while out of range
+                end
+            end
+        end
+
+        -- owned target still legit? (destroyed/rotated models fail here; throttled)
+        if os.clock() - lastValidCheck > 1 then
+            lastValidCheck = os.clock()
+            if not isStimModelValid(stimModel) then
+                warn("[autostim] owned target went invalid mid-heal - aborting")
+                cleanupAndReturn()
+                return
+            end
+        end
+
+        -- re-find tool live (handles tool consumed / re-given / manually equipped)
+        stimTool = findStimTool()
+        if DO_TOOL and stimTool and char2 then
+            local hum2 = char2:FindFirstChildWhichIsA("Humanoid")
+            if stimTool.Parent ~= char2 then
+                -- not equipped yet (or got unequipped): equip NOW, no delay
+                if hum2 then tryEquipFast(stimTool, hum2, char2) end
+            else
+                -- equipped (by us or manually): hammer activation
+                strongActivate(stimTool)
+            end
+        end
+
+        -- hammer the OWNED clickdetector (never re-scan mid-heal: re-scans can
+        -- return a different model and desync the click from our spot)
+        if DO_CLICKDETECTOR and stimClick then
+            pcall(function() fireclickdetector(stimClick) end)
+        end
+
+        task.wait(TICK)
+    end
+
+    if diedOrRespawned then
+        warn("[autostim] interrupted by death/respawn - NOT returning")
+        failStreak = 0 -- fresh body, don't punish it for the old one's failures
+    elseif not ok then
+        warn("[autostim] heal timed out, returning anyway")
+        noteFail(stimModel)
+    else
+        noteSuccess()
+    end
+
+    -- 6. unview + UNFREEZE + teleport back (skipped internally if dead/respawned)
+    cleanupAndReturn()
+    task.wait(HEAL_DEBOUNCE)
+end
+
+-- Respawn safety: a fresh body must never inherit a stuck heal or a return
+-- to where the old body died.
+-- INSTANT trigger: HealthChanged fires the millisecond damage lands, no poll wait.
+local lastDamageTrig = 0
+local function hookDamage(char)
+    task.spawn(function()
+        local hum
+        pcall(function()
+            hum = char:WaitForChild("Humanoid", 10)
+        end)
+        if not hum then return end
+        hum.HealthChanged:Connect(function(hp)
+            if healing then return end
+            if hp > 0 and hp ~= hum.MaxHealth then
+                if os.clock() - lastDamageTrig < 0.5 then return end
+                lastDamageTrig = os.clock()
+                task.spawn(function()
+                    pcall(healOnce)
+                end)
+            end
+        end)
+    end)
+end
+
+LocalPlayer.CharacterAdded:Connect(function()
+    healing = false
+    failStreak = 0
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        local _, _, h = getCharacter()
+        if cam and h then cam.CameraSubject = h end
+    end)
+    if LocalPlayer.Character then
+        hookDamage(LocalPlayer.Character)
+    end
+end)
+if LocalPlayer.Character then
+    hookDamage(LocalPlayer.Character)
+end
+
+--// Auto loop
+task.spawn(function()
+    while true do
+        local ok, err = pcall(function()
+            local _, _, myHum = getCharacter()
+            if myHum and myHum.Health > 0 and myHum.Health ~= myHum.MaxHealth then
+                healOnce()
+            end
+        end)
+        if not ok then warn("[autostim] loop error: " .. tostring(err)) end
+        task.wait(CHECK_INTERVAL)
+    end
+end)
+
+print("[autostim] loaded - watching for damage")
