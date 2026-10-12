@@ -1,0 +1,137 @@
+local v1 = game:GetService("Players")
+local v2 = game:GetService("RunService")
+local v3 = game:GetService("UserInputService")
+
+if _G.v4 then
+    _G.v4:Destroy()
+end
+
+local v5 = {}
+v5.__index = v5
+
+function v5.new()
+    local v6 = setmetatable({}, v5)
+
+    v6.v7 = {}
+    v6.v8 = nil
+    v6.v9 = false
+
+    v6.v10 = 1000
+    v6.v11 = 40
+    v6.v12 = 50
+    v6.v13 = 0.45
+    v6.v14 = 0.45
+
+    return v6
+end
+
+function v5:v15(v16, v17)
+    local v18 = v16:Connect(v17)
+    table.insert(self.v7, v18)
+end
+
+function v5:v19()
+    for _, v20 in ipairs(self.v7) do
+        if v20 then v20:Disconnect() end
+    end
+    self.v7 = {}
+
+    if self.v8 then
+        self.v8:Disconnect()
+        self.v8 = nil
+    end
+end
+
+function v5:Destroy()
+    self:v19()
+end
+
+function v5:v21(v22)
+    if self.v8 then return end
+
+    local v23 = v22:FindFirstChild("Humanoid")
+    local v24 = v22:FindFirstChild("HumanoidRootPart")
+    if not v23 or not v24 then return end
+
+    self.v25 = v23.WalkSpeed
+    self.v26 = v23.JumpPower
+
+    self.v8 = v2.RenderStepped:Connect(function(v27)
+        v23.WalkSpeed = self.v10
+
+        local v28 = v23:GetState()
+        local v29 = v28 == Enum.HumanoidStateType.Climbing
+
+        local v30 = v24.AssemblyLinearVelocity
+        local v31 = v23.MoveDirection
+
+        if not v29 then
+            v24.AssemblyLinearVelocity += Vector3.new(0, -(self.v11 + self.v12) * v27, 0)
+        end
+
+        if v31.Magnitude > 0 then
+            local v32 = Vector3.new(v30.X, 0, v30.Z)
+
+            local v33 = (v23.FloorMaterial == Enum.Material.Air) and self.v13 or self.v14
+
+            local v34 = v31 * (self.v10 * v33 * v27)
+
+            v24.AssemblyLinearVelocity = Vector3.new(
+                v32.X + v34.X,
+                v30.Y,
+                v32.Z + v34.Z
+            )
+        end
+    end)
+end
+
+function v5:v35(v36)
+    if self.v8 then
+        self.v8:Disconnect()
+        self.v8 = nil
+    end
+
+    local v37 = v36:FindFirstChild("Humanoid")
+
+    if v37 then
+        if self.v25 then
+            v37.WalkSpeed = self.v25
+        end
+        if self.v26 then
+            v37.JumpPower = self.v26
+        end
+    end
+end
+
+function v5:v38()
+    local v39 = v1.LocalPlayer
+
+    v3.InputBegan:Connect(function(v40, v41)
+        if v41 then return end
+        if v40.KeyCode == Enum.KeyCode.Z then
+            self.v9 = not self.v9
+
+            local v42 = v39.Character
+            if not v42 then return end
+
+            if self.v9 then
+                self:v21(v42)
+            else
+                self:v35(v42)
+            end
+        end
+    end)
+
+    self:v15(v39.CharacterAdded, function(v43)
+        self.v9 = false
+
+        if self.v8 then
+            self.v8:Disconnect()
+            self.v8 = nil
+        end
+    end)
+end
+
+local v44 = v5.new()
+v44:v38()
+_G.v4 = v44
