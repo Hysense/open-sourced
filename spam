@@ -1,0 +1,17 @@
+local plr = game:GetService("Players").LocalPlayer
+local mse = plr:GetMouse()
+
+local spam
+
+mse.Button1Down:Connect(function()
+	spam = true
+	while spam do
+		local tol = plr.Character and plr.Character:FindFirstChildOfClass("Tool")
+		if tol then tol:Activate() end
+		task.wait(.01)
+	end
+end)
+
+mse.Button1Up:Connect(function()
+	spam = false
+end)
